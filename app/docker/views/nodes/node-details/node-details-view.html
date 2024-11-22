@@ -1,0 +1,13 @@
+<host-overview
+  agent-api-version="$ctrl.state.agentApiVersion"
+  is-agent="$ctrl.state.isAgent"
+  host-details="$ctrl.hostDetails"
+  engine-details="$ctrl.engineDetails"
+  disks="$ctrl.disks"
+  devices="$ctrl.devices"
+  refresh-url="docker.nodes.node"
+  browse-url="docker.nodes.node.browse"
+  host-features-enabled="$ctrl.state.enableHostManagementFeatures"
+>
+  <swarm-node-details-panel details="$ctrl.nodeDetails" original-node="$ctrl.originalNode"></swarm-node-details-panel>
+</host-overview>

@@ -1,0 +1,7 @@
+<page-header ng-if="ctrl.state.viewReady" title="'Namespace list'" breadcrumbs="['Namespaces']" on-reload="(ctrl.onReload)" reload="true"></page-header>
+
+<kubernetes-view-loading view-ready="ctrl.state.viewReady"></kubernetes-view-loading>
+
+<div ng-if="ctrl.state.viewReady">
+  <kubernetes-namespaces-datatable dataset="ctrl.resourcePools" on-remove="(ctrl.removeAction)" on-refresh="(ctrl.getResourcePools)"></kubernetes-namespaces-datatable>
+</div>
