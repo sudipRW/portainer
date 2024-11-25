@@ -27,7 +27,7 @@ func Test_NeedsEncryptionMigration(t *testing.T) {
 	}{
 		{
 			name:         "portainer.edb + key",
-			dbname:       EncryptedDatabaseName,
+			dbname:       EncryptedMetadataTable,
 			key:          true,
 			expectError:  nil,
 			expectResult: false,
@@ -38,7 +38,7 @@ func Test_NeedsEncryptionMigration(t *testing.T) {
 		},
 		{
 			name:         "portainer.db + key (migration needed)",
-			dbname:       UnencryptedDatabaseName,
+			dbname:       UnencryptedMetadataTable,
 			key:          true,
 			expectError:  nil,
 			expectResult: true,
@@ -49,7 +49,7 @@ func Test_NeedsEncryptionMigration(t *testing.T) {
 		},
 		{
 			name:         "portainer.db + no key",
-			dbname:       UnencryptedDatabaseName,
+			dbname:       UnencryptedMetadataTable,
 			key:          false,
 			expectError:  nil,
 			expectResult: false,
@@ -82,7 +82,7 @@ func Test_NeedsEncryptionMigration(t *testing.T) {
 		},
 		{
 			name:         "portainer.edb + no key",
-			dbname:       EncryptedDatabaseName,
+			dbname:       EncryptedMetadataTable,
 			key:          false,
 			expectError:  ErrHaveEncryptedWithNoKey,
 			expectResult: false,
@@ -108,7 +108,7 @@ func Test_NeedsEncryptionMigration(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			connection := DbConnection{DB: db}
+			connection := DbConnection{}
 
 			if tc.key {
 				connection.EncryptionKey = []byte("secret")

@@ -82,7 +82,7 @@ func initFileService(dataStorePath string) portainer.FileService {
 }
 
 func initDataStore(flags *portainer.CLIFlags, secretKey []byte, fileService portainer.FileService, shutdownCtx context.Context) dataservices.DataStore {
-	connection, err := database.NewDatabase("boltdb", *flags.Data, secretKey)
+	connection, err := database.NewDatabase("postgres", *flags.Data, secretKey)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed creating database connection")
 	}

@@ -40,7 +40,7 @@ func NewTestStore(t testing.TB, init, secure bool) (bool, *Store, func(), error)
 		secretKey = nil
 	}
 
-	connection, err := database.NewDatabase("boltdb", storePath, secretKey)
+	connection, err := database.NewDatabase("postgres", storePath, secretKey)
 	if err != nil {
 		panic(err)
 	}

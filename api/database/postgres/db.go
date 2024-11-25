@@ -1,7 +1,9 @@
 package postgres
 
 import (
+	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -14,29 +16,53 @@ import (
 )
 
 const (
+	// Database configuration constants
 	DatabaseDriverName = "postgres"
-	DatabaseMaxOpen    = 25
-	DatabaseMaxIdle    = 25
-)
+	DatabaseMaxOpen   = 25
+	DatabaseMaxIdle   = 25
+	DatabaseTimeout   = 5 * time.Minute
 
-const (
-    EncryptedMetadataTable   = "encrypted_metadata"
-    UnencryptedMetadataTable = "unencrypted_metadata"
+	// Metadata table names
+	EncryptedMetadataTable   = "encrypted_metadata"
+	UnencryptedMetadataTable = "unencrypted_metadata"
 )
-
 
 var (
-	ErrHaveEncryptedAndUnencrypted = errors.New("Portainer has detected both an encrypted and un-encrypted database and cannot start")
-	ErrHaveEncryptedWithNoKey      = errors.New("The portainer database is encrypted, but no secret was loaded")
+	ErrHaveEncryptedAndUnencrypted = errors.New("portainer has detected both an encrypted and un-encrypted database and cannot start")
+	ErrHaveEncryptedWithNoKey      = errors.New("the portainer database is encrypted, but no secret was loaded")
+	ErrNoConnection               = errors.New("database connection is not initialized")
 )
 
+// DbConnection represents a PostgreSQL database connection
 type DbConnection struct {
 	ConnectionString string
 	Path            string
 	EncryptionKey   []byte
 	isEncrypted     bool
+	ctx             context.Context
+	cancelFunc      context.CancelFunc
 
 	*sqlx.DB
+}
+
+// NewConnection creates a new database connection
+func NewConnection(connectionString string, encryptionKey []byte) (*DbConnection, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	conn := &DbConnection{
+		ConnectionString: connectionString,
+		Path:            connectionString,
+		EncryptionKey:   encryptionKey,
+		ctx:             ctx,
+		cancelFunc:      cancel,
+	}
+
+	if err := conn.Open(); err != nil {
+		cancel()
+		return nil, err
+	}
+
+	return conn, nil
 }
 
 // GetStorePath returns the connection string path
@@ -52,70 +78,68 @@ func (connection *DbConnection) SetEncrypted(flag bool) {
 func (connection *DbConnection) IsEncryptedStore() bool {
 	return connection.getEncryptionKey() != nil
 }
-
-// NeedsEncryptionMigration checks the database state to determine if migration is required.
+func (connection *DbConnection) ConvertToKey(key int) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(key))
+    return b
+}
+// NeedsEncryptionMigration checks if database needs encryption migration
 func (connection *DbConnection) NeedsEncryptionMigration() (bool, error) {
-	// Query to check for the existence of specific tables
+	if connection.DB == nil {
+		return false, ErrNoConnection
+	}
+
 	checkTableExists := func(tableName string) (bool, error) {
-		var count int
-		query := fmt.Sprintf(`
-			SELECT COUNT(*) 
-			FROM information_schema.tables 
-			WHERE table_name = '%s';`, tableName)
-		err := connection.DB.QueryRow(query).Scan(&count)
-		if err != nil {
-			return false, err
-		}
-		return count > 0, nil
+		var exists bool
+		query := `
+			SELECT EXISTS (
+				SELECT FROM information_schema.tables 
+				WHERE table_schema = 'public' 
+				AND table_name = $1
+			);`
+		err := connection.QueryRowx(query, tableName).Scan(&exists)
+		return exists, err
 	}
 
-	// Check for unencrypted table (portainer.db equivalent)
-	haveUnencryptedTable, err := checkTableExists(UnencryptedMetadataTable)
+	haveUnencrypted, err := checkTableExists(UnencryptedMetadataTable)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to check unencrypted table: %w", err)
 	}
 
-	// Check for encrypted table (portainer.edb equivalent)
-	haveEncryptedTable, err := checkTableExists(EncryptedMetadataTable)
+	haveEncrypted, err := checkTableExists(EncryptedMetadataTable)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to check encrypted table: %w", err)
 	}
 
-	if haveUnencryptedTable && haveEncryptedTable {
-		// Case 7: both encrypted and unencrypted tables exist
+	switch {
+	case haveUnencrypted && haveEncrypted:
 		return false, ErrHaveEncryptedAndUnencrypted
-	}
-
-	if haveUnencryptedTable && connection.EncryptionKey != nil {
-		// Case 3: unencrypted table exists, and an encryption key is provided
-		return true, nil // Needs migration
-	}
-
-	if haveEncryptedTable && connection.EncryptionKey == nil {
-		// Case 2: encrypted table exists, but no encryption key is provided
+	case haveUnencrypted && connection.EncryptionKey != nil:
+		return true, nil
+	case haveEncrypted && connection.EncryptionKey == nil:
 		return false, ErrHaveEncryptedWithNoKey
+	default:
+		return false, nil
 	}
-
-	// Case 1, 4, 5, 6: no conflicting conditions
-	return false, nil
 }
 
 // Open opens and initializes the PostgreSQL database connection
 func (connection *DbConnection) Open() error {
-	log.Info().Str("connection", connection.ConnectionString).Msg("loading PortainerDB")
+	log.Info().Str("connection", connection.ConnectionString).Msg("connecting to PostgreSQL database")
 
-	db, err := sqlx.Open(DatabaseDriverName, connection.ConnectionString)
+	db, err := sqlx.Connect(DatabaseDriverName, connection.ConnectionString)
 	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
+		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	// Configure connection pool
 	db.SetMaxOpenConns(DatabaseMaxOpen)
 	db.SetMaxIdleConns(DatabaseMaxIdle)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxLifetime(DatabaseTimeout)
 
-	// Test the connection
-	if err := db.Ping(); err != nil {
-		return fmt.Errorf("failed to ping database: %w", err)
+	// Verify connection
+	if err := db.PingContext(connection.ctx); err != nil {
+		return fmt.Errorf("failed to verify database connection: %w", err)
 	}
 
 	connection.DB = db
@@ -124,7 +148,11 @@ func (connection *DbConnection) Open() error {
 
 // Close closes the PostgreSQL database connection
 func (connection *DbConnection) Close() error {
-	log.Info().Msg("closing PortainerDB")
+	log.Info().Msg("closing PostgreSQL connection")
+
+	if connection.cancelFunc != nil {
+		connection.cancelFunc()
+	}
 
 	if connection.DB != nil {
 		return connection.DB.Close()
@@ -133,12 +161,17 @@ func (connection *DbConnection) Close() error {
 	return nil
 }
 
-// UpdateTx executes the given function inside a transaction
+// UpdateTx executes the given function within a transaction
 func (connection *DbConnection) UpdateTx(fn func(portainer.Transaction) error) error {
-	tx, err := connection.Beginx()
-	if err != nil {
-		return err
+	if connection.DB == nil {
+		return ErrNoConnection
 	}
+
+	tx, err := connection.BeginTxx(connection.ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
 	defer func() {
 		if p := recover(); p != nil {
 			tx.Rollback()
@@ -152,53 +185,88 @@ func (connection *DbConnection) UpdateTx(fn func(portainer.Transaction) error) e
 	}
 
 	if err := fn(pgTx); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Error().Err(rbErr).Msg("failed to rollback transaction")
+		}
 		return err
 	}
 
 	return tx.Commit()
 }
 
-// ViewTx executes a read-only transaction (in PostgreSQL, this is similar to UpdateTx)
+// ViewTx executes a read-only transaction
 func (connection *DbConnection) ViewTx(fn func(portainer.Transaction) error) error {
-	return connection.UpdateTx(fn)
+	return connection.UpdateTx(fn) // PostgreSQL doesn't require special handling for read-only transactions
 }
 
-// BackupTo exports the database to a writer (simplified for PostgreSQL)
-func (connection *DbConnection) BackupTo(w io.Writer) error {
-	// In PostgreSQL, you might want to use pg_dump or a more robust backup method
-	rows, err := connection.DB.Query("SELECT schemaname, tablename, tableowner FROM pg_tables WHERE schemaname='public'")
+// GetNextIdentifier retrieves the next available ID for a table
+func (connection *DbConnection) GetNextIdentifier(tableName string) int {
+	var nextID int
+	query := fmt.Sprintf("SELECT COALESCE(MAX(id), 0) + 1 FROM %s", tableName)
+	
+	err := connection.GetContext(connection.ctx, &nextID, query)
 	if err != nil {
-		return err
+		log.Error().Err(err).Str("table", tableName).Msg("failed to get next identifier")
+		return 1 // Return 1 as fallback for first entry
+	}
+	
+	return nextID
+}
+
+// BackupTo exports the database to a writer
+func (connection *DbConnection) BackupTo(w io.Writer) error {
+	if connection.DB == nil {
+		return ErrNoConnection
+	}
+
+	rows, err := connection.QueryxContext(connection.ctx, `
+		SELECT 
+			table_schema,
+			table_name,
+			column_name,
+			data_type
+		FROM 
+			information_schema.columns
+		WHERE 
+			table_schema = 'public'
+		ORDER BY 
+			table_name, ordinal_position
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to query schema: %w", err)
 	}
 	defer rows.Close()
 
+	schemas := make(map[string][]string)
 	for rows.Next() {
-		var schemaName, tableName, tableOwner string
-		if err := rows.Scan(&schemaName, &tableName, &tableOwner); err != nil {
-			return err
+		var schema, table, column, dataType string
+		if err := rows.Scan(&schema, &table, &column, &dataType); err != nil {
+			return fmt.Errorf("failed to scan schema row: %w", err)
 		}
-		// Write table info to writer
-		fmt.Fprintf(w, "Table: %s, Schema: %s, Owner: %s\n", tableName, schemaName, tableOwner)
+		schemas[table] = append(schemas[table], fmt.Sprintf("%s %s", column, dataType))
+	}
+
+	// Write schema information
+	for table, columns := range schemas {
+		fmt.Fprintf(w, "Table: %s\nColumns:\n", table)
+		for _, col := range columns {
+			fmt.Fprintf(w, "  %s\n", col)
+		}
+		fmt.Fprintln(w, "---")
 	}
 
 	return nil
 }
 
-// GetNextIdentifier retrieves the next identifier for a given bucket/table
-func (connection *DbConnection) GetNextIdentifier(bucketName string) int {
-	var nextID int
-	query := fmt.Sprintf("SELECT COALESCE(MAX(id), 0) + 1 FROM %s", bucketName)
-	err := connection.Get(&nextID, query)
-	if err != nil {
-		log.Error().Err(err).Str("bucket", bucketName).Msg("failed to get next identifier")
-		return 0
+func (connection *DbConnection) getEncryptionKey() []byte {
+	if !connection.isEncrypted {
+		return nil
 	}
-	return nextID
+	return connection.EncryptionKey
 }
 
 // CreateObject creates a new object in the specified table
-func (connection *DbConnection) CreateObject(bucketName string, fn func(uint64) (int, any)) error {
+func (connection *DbConnection) CreateObject(bucketName string, fn func(uint64) (int, interface{})) error {
 	return connection.UpdateTx(func(tx portainer.Transaction) error {
 		nextID := uint64(connection.GetNextIdentifier(bucketName))
 		id, obj := fn(nextID)
@@ -218,13 +286,6 @@ func (connection *DbConnection) CreateObjectWithStringId(bucketName string, id [
 	return connection.UpdateTx(func(tx portainer.Transaction) error {
 		return tx.CreateObjectWithStringId(bucketName, id, obj)
 	})
-}
-
-func (connection *DbConnection) getEncryptionKey() []byte {
-	if !connection.isEncrypted {
-		return nil
-	}
-	return connection.EncryptionKey
 }
 
 // MarshalObject converts an object to JSON
